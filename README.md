@@ -27,6 +27,26 @@ This project is a simple Feature Flag Service built with Flask and SQLite. It al
 }
 ```
 
+```shell
+curl -X POST -H "Content-Type: application/json" -H "X-API-Key: your_super_secret_api_key" -d '{
+    "name": "new_checkout_flow",
+    "type": "boolean",
+    "default_value": "true",
+    "enabled": true,
+    "targeting_rules": {
+        "user_ids": ["alice", "bob"],
+        "percentage": 50
+    }
+}' http://127.0.0.1:5000/flags
+```
+
+curl http://127.0.0.1:5000/flags
+
+curl http://127.0.0.1:5000/flags/new_checkout_flow
+curl http://127.0.0.1:5000/flags/new_dashboard
+
+
+
 #### Get All Flags
 `GET /flags`
 
@@ -75,6 +95,16 @@ Returns the evaluated value for the given user context.
    ```
 
 The service will start on `http://localhost:5000`.
+
+### Running Redis Locally (Optional)
+
+If you want to run a local Redis instance for development or caching, you can use Docker:
+
+```bash
+docker run --name some-redis -p 6379:6379 -d redis
+```
+
+This will start a Redis server accessible at `localhost:6379`.
 
 ---
 For more details, see the code in `main.py`.

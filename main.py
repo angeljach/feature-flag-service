@@ -2,12 +2,19 @@ import sqlite3
 import json
 import random
 import time
+import redis # Import the redis library
 from flask import Flask, request, jsonify, g
 
 # --- Configuration ---
 DATABASE = 'feature_flags.db'
 API_KEY = 'your_super_secret_api_key' # In a real app, use environment variables or a secure vault
-CACHE_TTL_SECONDS = 60 # Time-to-live for cached flag configurations
+
+# Redis Configuration
+REDIS_HOST = 'localhost'
+REDIS_PORT = 6379
+REDIS_DB = 0
+REDIS_CACHE_TTL_SECONDS = 300 # Time-to-live for individual flag configurations in Redis (5 minutes)
+REDIS_FLAG_PREFIX = 'flag:' # Prefix for Redis keys to avoid conflicts
 
 app = Flask(__name__)
 
@@ -44,38 +51,74 @@ def init_db():
         db.commit()
         print(f"Database '{DATABASE}' initialized successfully.")
 
-# --- In-memory Cache for Flag Configurations ---
-# This dictionary will store flag configurations and their last update time
-# for quick lookups.
-flag_cache = {}
-last_cache_refresh = 0
+# --- Redis Helper Functions ---
+def get_redis_client():
+    """Establishes a Redis connection or returns the existing one."""
+    if 'redis' not in g:
+        try:
+            g.redis = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+            g.redis.ping() # Test connection
+            print("Connected to Redis successfully.")
+        except redis.exceptions.ConnectionError as e:
+            print(f"Could not connect to Redis: {e}. Falling back to database only.")
+            g.redis = None # Set to None if connection fails
+    return g.redis
 
-def refresh_cache():
-    """Refreshes the in-memory cache from the database."""
-    global flag_cache, last_cache_refresh
-    current_time = time.time()
-    if current_time - last_cache_refresh < CACHE_TTL_SECONDS:
-        return # Cache is still fresh enough
+def invalidate_flag_cache(flag_name):
+    """Invalidates a specific flag's entry in the Redis cache."""
+    r = get_redis_client()
+    if r:
+        key = f"{REDIS_FLAG_PREFIX}{flag_name}"
+        r.delete(key)
+        print(f"Invalidated Redis cache for flag: {flag_name}")
 
-    print("Refreshing feature flag cache...")
+def get_flag_from_cache_or_db(flag_name):
+    """
+    Attempts to retrieve a flag from Redis cache,
+    falls back to SQLite if not found or expired, and populates Redis.
+    """
+    r = get_redis_client()
+    if r:
+        key = f"{REDIS_FLAG_PREFIX}{flag_name}"
+        cached_flag_json = r.get(key)
+        if cached_flag_json:
+            try:
+                flag_config = json.loads(cached_flag_json)
+                # Ensure targeting_rules are parsed back to dict
+                if 'targeting_rules' in flag_config and isinstance(flag_config['targeting_rules'], str):
+                    flag_config['targeting_rules'] = json.loads(flag_config['targeting_rules'])
+                print(f"Flag '{flag_name}' retrieved from Redis cache.")
+                return flag_config
+            except json.JSONDecodeError as e:
+                print(f"Error decoding cached flag '{flag_name}': {e}. Fetching from DB.")
+                # If cache is corrupted, delete it and fetch from DB
+                r.delete(key)
+
+    # If not in Redis or Redis is unavailable, fetch from DB
     db = get_db()
     cursor = db.cursor()
-    cursor.execute('SELECT * FROM feature_flags')
-    flags = cursor.fetchall()
+    cursor.execute('SELECT * FROM feature_flags WHERE name = ?', (flag_name,))
+    flag = cursor.fetchone()
 
-    new_cache = {}
-    for flag in flags:
+    if flag:
         flag_dict = dict(flag)
         # Parse targeting rules from JSON string back to a Python object
         if flag_dict['targeting_rules']:
             flag_dict['targeting_rules'] = json.loads(flag_dict['targeting_rules'])
         else:
             flag_dict['targeting_rules'] = {}
-        new_cache[flag_dict['name']] = flag_dict
+        
+        # Store in Redis if connected
+        if r:
+            # Store targeting_rules as JSON string in Redis for simpler storage
+            flag_to_cache = dict(flag_dict)
+            flag_to_cache['targeting_rules'] = json.dumps(flag_to_cache['targeting_rules'])
+            r.setex(key, REDIS_CACHE_TTL_SECONDS, json.dumps(flag_to_cache))
+            print(f"Flag '{flag_name}' fetched from DB and stored in Redis.")
+        return flag_dict
     
-    flag_cache = new_cache
-    last_cache_refresh = current_time
-    print(f"Cache refreshed. {len(flag_cache)} flags loaded.")
+    print(f"Flag '{flag_name}' not found in DB.")
+    return None
 
 # --- Feature Flag Evaluation Logic ---
 def evaluate_flag(flag_name, user_context=None):
@@ -93,11 +136,10 @@ def evaluate_flag(flag_name, user_context=None):
                evaluated_value: The value of the flag for the given context.
                flag_found_status: True if the flag exists, False otherwise.
     """
-    refresh_cache() # Ensure cache is up-to-date
-
-    flag_config = flag_cache.get(flag_name)
+    flag_config = get_flag_from_cache_or_db(flag_name)
+    
     if not flag_config:
-        print(f"Flag '{flag_name}' not found in cache.")
+        print(f"Flag '{flag_name}' not found.")
         return None, False
 
     # 1. Check if the flag is globally enabled/disabled
@@ -119,14 +161,16 @@ def evaluate_flag(flag_name, user_context=None):
         if user_context and 'user_id' in user_context:
             # Use user_id to ensure consistent bucketing for percentage rollouts
             # A simple hash or modulo can be used for deterministic assignment
-            seed = int(user_context['user_id']) if user_context['user_id'].isdigit() else sum(ord(c) for c in user_context['user_id'])
+            # Ensure user_id is treated as a string for hashing
+            user_id_str = str(user_context['user_id'])
+            seed = sum(ord(c) for c in user_id_str) # Simple deterministic seed
             random.seed(seed) # Seed the random generator for consistency per user
             
             if random.uniform(0, 100) < rules['percentage']:
-                print(f"Flag '{flag_name}' enabled for user_id '{user_context['user_id']}' via percentage rule ({rules['percentage']}%).")
+                print(f"Flag '{flag_name}' enabled for user_id '{user_id_str}' via percentage rule ({rules['percentage']}%).")
                 return flag_config['default_value'], True
             else:
-                print(f"Flag '{flag_name}' disabled for user_id '{user_context['user_id']}' via percentage rule.")
+                print(f"Flag '{flag_name}' disabled for user_id '{user_id_str}' via percentage rule.")
                 return flag_config['default_value'], True
         else:
             # If no user_id for percentage, default to global enabled state
@@ -188,7 +232,7 @@ def create_flag():
             (name, flag_type, default_value, enabled, targeting_rules)
         )
         db.commit()
-        refresh_cache() # Invalidate/refresh cache after write
+        invalidate_flag_cache(name) # Invalidate Redis cache for the new flag
         return jsonify({"message": "Flag created successfully", "id": cursor.lastrowid}), 201
     except sqlite3.IntegrityError:
         return jsonify({"error": f"Flag with name '{name}' already exists"}), 409
@@ -198,6 +242,8 @@ def create_flag():
 @app.route('/flags', methods=['GET'])
 def get_all_flags():
     """Retrieves all feature flags."""
+    # For getting all flags, we typically bypass Redis cache to ensure we get a full list
+    # A more advanced system might cache the list of flag names.
     db = get_db()
     cursor = db.cursor()
     cursor.execute('SELECT * FROM feature_flags')
@@ -218,8 +264,7 @@ def get_all_flags():
 @app.route('/flags/<string:flag_name>', methods=['GET'])
 def get_flag(flag_name):
     """Retrieves a single feature flag by name."""
-    refresh_cache() # Ensure cache is up-to-date
-    flag_config = flag_cache.get(flag_name)
+    flag_config = get_flag_from_cache_or_db(flag_name)
 
     if flag_config:
         # Return a copy to avoid modifying cached object directly
@@ -278,7 +323,14 @@ def update_flag(flag_name):
         db.commit()
         if cursor.rowcount == 0:
             return jsonify({"error": f"Flag '{flag_name}' not found"}), 404
-        refresh_cache() # Invalidate/refresh cache after write
+        
+        # If the name was changed, invalidate both old and new names in cache
+        if 'name' in data and data['name'] != flag_name:
+            invalidate_flag_cache(flag_name) # Old name
+            invalidate_flag_cache(data['name']) # New name
+        else:
+            invalidate_flag_cache(flag_name) # Invalidate Redis cache for the updated flag
+        
         return jsonify({"message": f"Flag '{flag_name}' updated successfully"}), 200
     except sqlite3.IntegrityError:
         return jsonify({"error": f"New name '{data['name']}' already exists for another flag"}), 409
@@ -298,7 +350,7 @@ def delete_flag(flag_name):
         db.commit()
         if cursor.rowcount == 0:
             return jsonify({"error": f"Flag '{flag_name}' not found"}), 404
-        refresh_cache() # Invalidate/refresh cache after write
+        invalidate_flag_cache(flag_name) # Invalidate Redis cache for the deleted flag
         return jsonify({"message": f"Flag '{flag_name}' deleted successfully"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -316,9 +368,12 @@ def evaluate(flag_name):
     if flag_found:
         # Attempt to convert default_value based on stored type
         # This is a simplification; a full system would handle type casting more robustly
-        flag_config = flag_cache.get(flag_name)
+        flag_config = get_flag_from_cache_or_db(flag_name) # Re-fetch to get type info if needed
         if flag_config:
             if flag_config['type'] == 'boolean':
+                # Convert "true"/"false" strings to actual booleans
+                if isinstance(evaluated_value, str):
+                    return jsonify({"flag_name": flag_name, "value": evaluated_value.lower() == 'true'}), 200
                 return jsonify({"flag_name": flag_name, "value": bool(int(evaluated_value)) if evaluated_value is not None else False}), 200
             elif flag_config['type'] == 'number':
                 try:
@@ -340,6 +395,5 @@ def evaluate(flag_name):
 # --- Main Execution ---
 if __name__ == '__main__':
     init_db() # Initialize the database when the app starts
-    with app.app_context():
-        refresh_cache() # Initial cache warm-up
+    # No global refresh_cache here; flags are loaded on demand into Redis
     app.run(debug=True, port=5000) # Run the Flask app
